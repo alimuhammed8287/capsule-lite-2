@@ -4,7 +4,7 @@ plugins {
 }
 
 android {
-    namespace = "com.example.capsulelite"
+    namespace = "com.example.capsule"
     compileSdk = 34
 
     defaultConfig {
