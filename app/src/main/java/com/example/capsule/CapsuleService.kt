@@ -5,6 +5,7 @@ import android.app.Notification
 import android.app.PendingIntent
 import android.content.ComponentName
 import android.content.Context
+import android.content.SharedPreferences // NEW
 import android.graphics.Color
 import android.graphics.PixelFormat
 import android.graphics.drawable.GradientDrawable
@@ -31,8 +32,8 @@ import android.widget.TextView
 
 /**
  * Draws a black "capsule" around the front-camera cutout.
- *  - collapsed: just covers the cutout
- *  - expanded: shows media info + controls, or the latest notification
+ * - collapsed: just covers the cutout
+ * - expanded: shows media info + controls, or the latest notification
  * The NotificationListenerService is also what grants access to media sessions.
  */
 class CapsuleService : NotificationListenerService() {
@@ -40,8 +41,8 @@ class CapsuleService : NotificationListenerService() {
     private lateinit var uiCtx: Context
     private lateinit var wm: WindowManager
     private lateinit var lp: WindowManager.LayoutParams
-
     private var root: LinearLayout? = null
+
     private lateinit var icon: ImageView
     private lateinit var textCol: LinearLayout
     private lateinit var title: TextView
@@ -54,15 +55,34 @@ class CapsuleService : NotificationListenerService() {
     private var miniH = 0
     private var expW = 0
     private var expH = 0
-
     private var expanded = false
     private var showingNotif = false
     private var notifIntent: PendingIntent? = null
 
     private var msm: MediaSessionManager? = null
     private var controller: MediaController? = null
-
     private val handler = Handler(Looper.getMainLooper())
+
+    // NEW: remembers the last Maps text so we don't popup again for the same text
+    private var lastMapsText = ""
+
+    // NEW: the small storage box that holds your size/position settings
+    private val prefs: SharedPreferences by lazy {
+        getSharedPreferences("capsule", MODE_PRIVATE)
+    }
+
+    // NEW: runs when a slider saves a value, then rebuilds the capsule
+    private val prefListener = SharedPreferences.OnSharedPreferenceChangeListener { _, _ ->
+        handler.post {
+            if (root == null) return@post
+            root?.let { v -> runCatching { wm.removeView(v) } }
+            root = null
+            expanded = false
+            buildOverlay()
+            refreshMedia()
+        }
+    }
+
     private val collapse = Runnable {
         showingNotif = false
         notifIntent = null
@@ -72,12 +92,14 @@ class CapsuleService : NotificationListenerService() {
 
     private val controllerCallback = object : MediaController.Callback() {
         override fun onPlaybackStateChanged(state: PlaybackState?) = refreshMedia()
+
         override fun onMetadataChanged(metadata: MediaMetadata?) {
             refreshMedia()
             if (controller?.playbackState?.state == PlaybackState.STATE_PLAYING && !showingNotif) {
                 peek(3000)
             }
         }
+
         override fun onSessionDestroyed() = pickController(null)
     }
 
@@ -85,11 +107,11 @@ class CapsuleService : NotificationListenerService() {
         MediaSessionManager.OnActiveSessionsChangedListener { list -> pickController(list) }
 
     // ---------- lifecycle ----------
-
     override fun onListenerConnected() {
         if (root != null) return
         if (!Settings.canDrawOverlays(this)) return
         buildOverlay()
+        prefs.registerOnSharedPreferenceChangeListener(prefListener) // NEW
         val m = getSystemService(MediaSessionManager::class.java)
         msm = m
         val cn = ComponentName(this, CapsuleService::class.java)
@@ -105,6 +127,7 @@ class CapsuleService : NotificationListenerService() {
     }
 
     private fun teardown() {
+        runCatching { prefs.unregisterOnSharedPreferenceChangeListener(prefListener) } // NEW
         handler.removeCallbacksAndMessages(null)
         controller?.unregisterCallback(controllerCallback)
         controller = null
@@ -116,7 +139,6 @@ class CapsuleService : NotificationListenerService() {
     }
 
     // ---------- overlay ----------
-
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
 
     private fun buildOverlay() {
@@ -128,11 +150,18 @@ class CapsuleService : NotificationListenerService() {
         val cut = display.cutout?.boundingRectTop?.takeIf { !it.isEmpty }
 
         // Size/position of the collapsed pill follows the real cutout when available.
-        miniW = if (cut != null) cut.width() + dp(20) else dp(96)
-        miniH = if (cut != null) cut.height() + dp(8) else dp(34)
-        val topY = if (cut != null) (cut.top - dp(4)).coerceAtLeast(0) else dp(6)
+        // NEW: minimum 100dp x 40dp so the pill is easier to tap
+        miniW = maxOf(if (cut != null) cut.width() + dp(20) else dp(96), dp(100))
+        miniH = maxOf(if (cut != null) cut.height() + dp(8) else dp(34), dp(40))
+        var topY = if (cut != null) (cut.top - dp(4)).coerceAtLeast(0) else dp(6) // NEW: var
         expW = minOf(screenW - dp(24), dp(340))
         expH = dp(64)
+
+        // NEW: saved settings override the automatic sizes
+        if (prefs.contains("miniW")) miniW = dp(prefs.getInt("miniW", 100))
+        if (prefs.contains("miniH")) miniH = dp(prefs.getInt("miniH", 40))
+        if (prefs.contains("expW")) expW = minOf(screenW - dp(24), dp(prefs.getInt("expW", 340)))
+        if (prefs.contains("topY")) topY = dp(prefs.getInt("topY", 6))
 
         val accent = uiCtx.getColor(android.R.color.system_accent1_200)
 
@@ -152,18 +181,21 @@ class CapsuleService : NotificationListenerService() {
             }
             scaleType = ImageView.ScaleType.CENTER_CROP
         }
+
         title = TextView(uiCtx).apply {
             setTextColor(Color.WHITE)
             textSize = 14f
             isSingleLine = true
             ellipsize = TextUtils.TruncateAt.END
         }
+
         subtitle = TextView(uiCtx).apply {
             setTextColor(Color.LTGRAY)
             textSize = 12f
             isSingleLine = true
             ellipsize = TextUtils.TruncateAt.END
         }
+
         textCol = LinearLayout(uiCtx).apply {
             orientation = LinearLayout.VERTICAL
             layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
@@ -182,9 +214,11 @@ class CapsuleService : NotificationListenerService() {
                 peek(4000)
             }
         }
+
         btnPrev = control(android.R.drawable.ic_media_previous) {
             controller?.transportControls?.skipToPrevious()
         }
+
         btnPlay = control(android.R.drawable.ic_media_play) {
             val c = controller ?: return@control
             if (c.playbackState?.state == PlaybackState.STATE_PLAYING) {
@@ -193,6 +227,7 @@ class CapsuleService : NotificationListenerService() {
                 c.transportControls.play()
             }
         }
+
         btnNext = control(android.R.drawable.ic_media_next) {
             controller?.transportControls?.skipToNext()
         }
@@ -213,6 +248,7 @@ class CapsuleService : NotificationListenerService() {
         ).apply {
             gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL
             y = topY
+            x = dp(prefs.getInt("offX", 0)) // NEW: left/right shift
             layoutInDisplayCutoutMode =
                 WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS
         }
@@ -223,7 +259,6 @@ class CapsuleService : NotificationListenerService() {
     }
 
     // ---------- state / animation ----------
-
     private fun applyVisibility() {
         val content = if (expanded) View.VISIBLE else View.GONE
         icon.visibility = content
@@ -247,6 +282,7 @@ class CapsuleService : NotificationListenerService() {
         val fromH = lp.height
         val toW = if (e) expW else miniW
         val toH = if (e) expH else miniH
+
         ValueAnimator.ofFloat(0f, 1f).apply {
             duration = 260
             interpolator = DecelerateInterpolator()
@@ -263,7 +299,7 @@ class CapsuleService : NotificationListenerService() {
     private fun peek(ms: Long) {
         setExpanded(true)
         handler.removeCallbacks(collapse)
-        handler.postDelayed(collapse, ms)
+        handler.postDelayed(collapse, maxOf(ms, 8000L)) // NEW: at least 8 seconds
     }
 
     private fun onCapsuleTap() {
@@ -282,7 +318,6 @@ class CapsuleService : NotificationListenerService() {
     }
 
     // ---------- media ----------
-
     private fun pickController(list: List<MediaController>?) {
         controller?.unregisterCallback(controllerCallback)
         val next = list?.firstOrNull { it.playbackState?.state == PlaybackState.STATE_PLAYING }
@@ -325,15 +360,27 @@ class CapsuleService : NotificationListenerService() {
         runCatching { packageManager.getApplicationIcon(pkg) }.getOrNull()
 
     // ---------- notifications ----------
-
     override fun onNotificationPosted(sbn: StatusBarNotification) {
         if (root == null) return
         val n = sbn.notification
-        if (sbn.isOngoing || sbn.packageName == packageName) return
+
+        // NEW: Maps navigation is "ongoing", so let it through
+        val isMaps = sbn.packageName == "com.google.android.apps.maps"
+        if ((sbn.isOngoing && !isMaps) || sbn.packageName == packageName) return
+
         if (n.category == Notification.CATEGORY_TRANSPORT) return
         if ((n.flags and Notification.FLAG_GROUP_SUMMARY) != 0) return
+
         val t = n.extras.getCharSequence(Notification.EXTRA_TITLE) ?: return
         val body = n.extras.getCharSequence(Notification.EXTRA_TEXT) ?: ""
+
+        // NEW: Maps updates every few seconds; only show when the text changes
+        if (isMaps) {
+            val key = "$t|$body"
+            if (key == lastMapsText) return
+            lastMapsText = key
+        }
+
         handler.post {
             showingNotif = true
             notifIntent = n.contentIntent
