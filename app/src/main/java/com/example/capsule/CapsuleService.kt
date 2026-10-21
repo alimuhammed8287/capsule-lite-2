@@ -79,6 +79,7 @@ class CapsuleService : NotificationListenerService() {
             root = null
             expanded = false
             buildOverlay()
+            msm?.let { pickController(it.getActiveSessions(ComponentName(this, CapsuleService::class.java))) }
             refreshMedia()
         }
     }
@@ -147,7 +148,7 @@ class CapsuleService : NotificationListenerService() {
         wm = uiCtx.getSystemService(WindowManager::class.java)
 
         val screenW = uiCtx.resources.displayMetrics.widthPixels
-        val cut = display.cutout?.boundingRectTop?.takeIf { !it.isEmpty }
+        val cut = wm.currentWindowMetrics.windowInsets.displayCutout?.boundingRectTop?.takeIf { !it.isEmpty }
 
         // Size/position of the collapsed pill follows the real cutout when available.
         // NEW: minimum 100dp x 40dp so the pill is easier to tap
@@ -320,8 +321,9 @@ class CapsuleService : NotificationListenerService() {
     // ---------- media ----------
     private fun pickController(list: List<MediaController>?) {
         controller?.unregisterCallback(controllerCallback)
-        val next = list?.firstOrNull { it.playbackState?.state == PlaybackState.STATE_PLAYING }
-            ?: list?.firstOrNull()
+        val next = if (!prefs.getBoolean("showMusic", true)) null
+            else list?.firstOrNull { it.playbackState?.state == PlaybackState.STATE_PLAYING }
+                ?: list?.firstOrNull()
         controller = next
         next?.registerCallback(controllerCallback)
         refreshMedia()
@@ -368,6 +370,11 @@ class CapsuleService : NotificationListenerService() {
         val isMaps = sbn.packageName == "com.google.android.apps.maps"
         if ((sbn.isOngoing && !isMaps) || sbn.packageName == packageName) return
 
+        // Settings toggles
+        val debugMaps = prefs.getBoolean("debugMaps", false)
+        if (isMaps && !prefs.getBoolean("showMaps", true)) return
+        if (!isMaps && !prefs.getBoolean("showNotifs", true)) return
+
         if (n.category == Notification.CATEGORY_TRANSPORT) return
         if ((n.flags and Notification.FLAG_GROUP_SUMMARY) != 0) return
 
@@ -377,18 +384,19 @@ class CapsuleService : NotificationListenerService() {
         // NEW: Maps updates every few seconds; only show when the text changes
         if (isMaps) {
             val key = "$t|$body"
-            if (key == lastMapsText) return
+            if (key == lastMapsText && !debugMaps) return
             lastMapsText = key
+            if (debugMaps) android.util.Log.d("CapsuleMaps", "title=[$t] body=[$body]")
         }
 
         handler.post {
             showingNotif = true
             notifIntent = n.contentIntent
-            title.text = t
+            title.text = if (isMaps && debugMaps) "DEBUG: $t" else t
             subtitle.text = body
             icon.setImageDrawable(appIcon(sbn.packageName))
             applyVisibility()
-            peek(4000)
+            peek(if (isMaps && debugMaps) 10000 else 4000)
         }
     }
 }
