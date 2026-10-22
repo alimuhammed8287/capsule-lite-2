@@ -1,6 +1,9 @@
 package com.example.capsule
 
 import android.animation.ValueAnimator
+import android.view.MotionEvent
+import android.widget.FrameLayout
+import java.io.File
 import android.content.BroadcastReceiver
 import android.content.Intent
 import android.content.IntentFilter
@@ -156,7 +159,11 @@ class CapsuleService : NotificationListenerService() {
     // ---------- overlay ----------
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
 
+    // Extra invisible touch margin around the pill, so taps near its edges register
+    private fun touchPad() = dp(10)
+
     private fun buildOverlay() {
+        val pad = touchPad()
         val display = getSystemService(DisplayManager::class.java).getDisplay(Display.DEFAULT_DISPLAY)
         uiCtx = createWindowContext(display, WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY, null)
         wm = uiCtx.getSystemService(WindowManager::class.java)
@@ -264,23 +271,39 @@ class CapsuleService : NotificationListenerService() {
         r.addView(btnNext)
 
         lp = WindowManager.LayoutParams(
-            miniW, miniH,
+            miniW + 2 * pad, miniH + 2 * pad,
             WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
             WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
                 WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
-                WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+                WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS or
+                WindowManager.LayoutParams.FLAG_WATCH_OUTSIDE_TOUCH,
             PixelFormat.TRANSLUCENT
         ).apply {
             gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL
-            y = topY
+            y = (topY - pad).coerceAtLeast(0)
             x = dp(prefs.getInt("offX", 0)) // NEW: left/right shift
             layoutInDisplayCutoutMode =
                 WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS
         }
 
-        root = r
+        val wrap = FrameLayout(uiCtx).apply {
+            setOnClickListener { onCapsuleTap() }
+            setOnTouchListener { _, e ->
+                // Tap anywhere outside the window while expanded: collapse
+                if (e.action == MotionEvent.ACTION_OUTSIDE && expanded) {
+                    handler.removeCallbacks(collapse)
+                    collapse.run()
+                }
+                false
+            }
+            addView(r, FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT
+            ).apply { setMargins(pad, pad, pad, pad) })
+        }
+        root = wrap
         applyVisibility()
-        wm.addView(r, lp)
+        wm.addView(wrap, lp)
     }
 
     // ---------- state / animation ----------
@@ -315,8 +338,9 @@ class CapsuleService : NotificationListenerService() {
 
         val fromW = lp.width
         val fromH = lp.height
-        val toW = if (e) expW else miniW
-        val toH = if (e) expH else miniH
+        val pad = touchPad()
+        val toW = (if (e) expW else miniW) + 2 * pad
+        val toH = (if (e) expH else miniH) + 2 * pad
 
         ValueAnimator.ofFloat(0f, 1f).apply {
             duration = 260
@@ -420,6 +444,17 @@ class CapsuleService : NotificationListenerService() {
         sticky?.let { handleBattery(it) }
     }
 
+    // Current in microamps, or null if no method gave a real (non-zero) value
+    private fun readCurrentUa(): Int? {
+        val bm = getSystemService(BatteryManager::class.java)
+        val fromApi = bm.getIntProperty(BatteryManager.BATTERY_PROPERTY_CURRENT_NOW)
+        if (fromApi != Int.MIN_VALUE && fromApi != 0) return fromApi
+        val fromFile = runCatching {
+            File("/sys/class/power_supply/battery/current_now").readText().trim().toInt()
+        }.getOrNull()
+        return if (fromFile != null && fromFile != 0) fromFile else null
+    }
+
     private fun handleBattery(i: Intent) {
         val level = i.getIntExtra(BatteryManager.EXTRA_LEVEL, -1)
         val scale = i.getIntExtra(BatteryManager.EXTRA_SCALE, 100).coerceAtLeast(1)
@@ -439,16 +474,17 @@ class CapsuleService : NotificationListenerService() {
             else -> "Charging"
         }
 
-        // Some phones don't report current; Integer.MIN_VALUE means "not supported"
-        val bm = getSystemService(BatteryManager::class.java)
-        val currentUa = bm.getIntProperty(BatteryManager.BATTERY_PROPERTY_CURRENT_NOW)
-        val currentText = if (currentUa == Int.MIN_VALUE) "n/a" else {
+        val parts = mutableListOf(source)
+        val currentUa = readCurrentUa()
+        if (currentUa != null) {
             val mA = Math.abs(currentUa) / 1000
             val watts = Math.abs(voltageMv.toDouble() * currentUa.toDouble()) / 1e9
-            "$mA mA \u00B7 %.1f W".format(watts)
+            parts.add("$mA mA")
+            parts.add("%.1f W".format(watts))
         }
-        chargeDetail = "$source \u00B7 $currentText \u00B7 %.2f V \u00B7 %.1f\u00B0C"
-            .format(voltageMv / 1000.0, tempC)
+        parts.add("%.2f V".format(voltageMv / 1000.0))
+        parts.add("%.1f\u00B0C".format(tempC))
+        chargeDetail = parts.joinToString(" \u00B7 ")
 
         refreshMedia()
     }
