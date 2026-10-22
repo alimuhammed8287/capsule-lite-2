@@ -39,16 +39,25 @@ class MainActivity : Activity() {
         button(col, "2. Allow notification access") {
             startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS))
         }
-        button(col, "3. App info (battery: No restrictions, enable Autostart)") {
+        button(col, "3. Keep-alive: turn on Capsule Lite in Accessibility") {
+            startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+        }
+        button(col, "4. App info (battery: No restrictions, Autostart)") {
             startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:$packageName")))
+        }
+        button(col, "5. Allow brightness control (for brightness gestures)") {
+            startActivity(Intent(Settings.ACTION_MANAGE_WRITE_SETTINGS, Uri.parse("package:$packageName")))
         }
 
         header(col, "Show in the pill")
         toggle(col, "Music", "showMusic", true)
         toggle(col, "Google Maps navigation", "showMaps", true)
         toggle(col, "Other notifications", "showNotifs", true)
-        toggle(col, "Debug: show raw Maps text", "debugMaps", false)
         toggle(col, "Show charging status", "showCharging", true)
+        toggle(col, "Debug: show raw Maps text", "debugMaps", false)
+
+        header(col, "Gestures (tap a row to change its action)")
+        for (key in CapsulePrefs.gestureKeys) gestureButton(col, key)
 
         header(col, "Size and position")
         slider(col, "Collapsed width", "miniW", 40, 200, 100)
@@ -88,6 +97,23 @@ class MainActivity : Activity() {
         })
     }
 
+    // Each tap moves the gesture to the next action in the list
+    private fun gestureButton(col: LinearLayout, key: String) {
+        fun label(action: String) =
+            "${CapsulePrefs.gestureLabels[key]}: ${CapsulePrefs.actionLabels[action] ?: action}"
+
+        val current = prefs.getString(key, CapsulePrefs.defaultFor(key)) ?: "none"
+        val b = Button(this).apply { text = label(current) }
+        b.setOnClickListener {
+            val cur = prefs.getString(key, CapsulePrefs.defaultFor(key)) ?: "none"
+            val idx = CapsulePrefs.actions.indexOf(cur)
+            val next = CapsulePrefs.actions[(idx + 1) % CapsulePrefs.actions.size]
+            prefs.edit().putString(key, next).apply()
+            b.text = label(next)
+        }
+        col.addView(b)
+    }
+
     private fun slider(col: LinearLayout, label: String, key: String, lo: Int, hi: Int, default: Int) {
         val start = prefs.getInt(key, default)
         val caption = TextView(this)
@@ -114,8 +140,16 @@ class MainActivity : Activity() {
         val listener = Settings.Secure
             .getString(contentResolver, "enabled_notification_listeners")
             ?.contains(packageName) == true
-        status.text = "Overlay permission: ${if (overlay) "OK" else "missing"}\n" +
-            "Notification access: ${if (listener) "OK" else "missing"}"
+        val keepAlive = Settings.Secure
+            .getString(contentResolver, Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES)
+            ?.contains(packageName) == true
+        val brightness = Settings.System.canWrite(this)
+
+        status.text = "Overlay: ${if (overlay) "OK" else "missing"}\n" +
+            "Notification access: ${if (listener) "OK" else "missing"}\n" +
+            "Keep-alive (Accessibility): ${if (keepAlive) "OK" else "off"}\n" +
+            "Brightness control: ${if (brightness) "OK" else "off"}"
+
         if (overlay && listener) {
             NotificationListenerService.requestRebind(
                 ComponentName(this, CapsuleService::class.java)
