@@ -1,6 +1,12 @@
 package com.example.capsule
 
 import android.animation.ValueAnimator
+import android.content.BroadcastReceiver
+import android.content.Intent
+import android.content.IntentFilter
+import android.os.BatteryManager
+import android.view.animation.OvershootInterpolator
+import androidx.core.content.ContextCompat
 import android.app.Notification
 import android.app.PendingIntent
 import android.content.ComponentName
@@ -50,6 +56,12 @@ class CapsuleService : NotificationListenerService() {
     private lateinit var btnPrev: ImageButton
     private lateinit var btnPlay: ImageButton
     private lateinit var btnNext: ImageButton
+    private lateinit var chargeText: TextView
+
+    // Charging state (filled by the battery receiver)
+    private var charging = false
+    private var chargePct = 0
+    private var chargeDetail = ""
 
     private var miniW = 0
     private var miniH = 0
@@ -112,6 +124,7 @@ class CapsuleService : NotificationListenerService() {
         if (root != null) return
         if (!Settings.canDrawOverlays(this)) return
         buildOverlay()
+        registerBattery()
         prefs.registerOnSharedPreferenceChangeListener(prefListener) // NEW
         val m = getSystemService(MediaSessionManager::class.java)
         msm = m
@@ -130,6 +143,7 @@ class CapsuleService : NotificationListenerService() {
     private fun teardown() {
         runCatching { prefs.unregisterOnSharedPreferenceChangeListener(prefListener) } // NEW
         handler.removeCallbacksAndMessages(null)
+        runCatching { unregisterReceiver(batteryReceiver) }
         controller?.unregisterCallback(controllerCallback)
         controller = null
         runCatching { msm?.removeOnActiveSessionsChangedListener(sessionsListener) }
@@ -233,6 +247,16 @@ class CapsuleService : NotificationListenerService() {
             controller?.transportControls?.skipToNext()
         }
 
+        chargeText = TextView(uiCtx).apply {
+            setTextColor(Color.WHITE)
+            textSize = 13f
+            isSingleLine = true
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply { marginStart = dp(12) }
+        }
+        r.addView(chargeText)
         r.addView(icon)
         r.addView(textCol)
         r.addView(btnPrev)
@@ -264,6 +288,8 @@ class CapsuleService : NotificationListenerService() {
         val content = if (expanded) View.VISIBLE else View.GONE
         icon.visibility = content
         textCol.visibility = content
+        chargeText.visibility = if (!expanded && chargeVisibleCollapsed()) View.VISIBLE else View.GONE
+        chargeText.text = "\u26A1 $chargePct%"
         val buttons = if (expanded && !showingNotif && controller != null) View.VISIBLE else View.GONE
         btnPrev.visibility = buttons
         btnPlay.visibility = buttons
@@ -277,7 +303,15 @@ class CapsuleService : NotificationListenerService() {
             return
         }
         expanded = e
+        if (e) {
+            icon.alpha = 0f
+            textCol.alpha = 0f
+        }
         applyVisibility()
+        if (e) {
+            icon.animate().alpha(1f).setStartDelay(120).setDuration(180).start()
+            textCol.animate().alpha(1f).setStartDelay(120).setDuration(180).start()
+        }
 
         val fromW = lp.width
         val fromH = lp.height
@@ -286,7 +320,7 @@ class CapsuleService : NotificationListenerService() {
 
         ValueAnimator.ofFloat(0f, 1f).apply {
             duration = 260
-            interpolator = DecelerateInterpolator()
+            interpolator = OvershootInterpolator(0.6f)
             addUpdateListener {
                 val f = it.animatedFraction
                 lp.width = (fromW + (toW - fromW) * f).toInt()
@@ -308,7 +342,7 @@ class CapsuleService : NotificationListenerService() {
             runCatching { notifIntent?.send() }
             handler.removeCallbacks(collapse)
             collapse.run()
-        } else if (controller != null) {
+        } else if (controller != null || chargeVisibleCollapsed()) {
             if (expanded) {
                 handler.removeCallbacks(collapse)
                 collapse.run()
@@ -335,8 +369,13 @@ class CapsuleService : NotificationListenerService() {
         val c = controller
         if (!showingNotif) {
             if (c == null) {
-                title.text = ""
-                subtitle.text = ""
+                if (charging && showCharging()) {
+                    title.text = "$chargePct% \u00B7 Charging"
+                    subtitle.text = chargeDetail
+                } else {
+                    title.text = ""
+                    subtitle.text = ""
+                }
                 icon.setImageDrawable(null)
             } else {
                 val md = c.metadata
@@ -360,6 +399,59 @@ class CapsuleService : NotificationListenerService() {
 
     private fun appIcon(pkg: String) =
         runCatching { packageManager.getApplicationIcon(pkg) }.getOrNull()
+
+    // ---------- charging ----------
+
+    private fun showCharging() = prefs.getBoolean("showCharging", true)
+
+    private fun chargeVisibleCollapsed() =
+        charging && showCharging() && controller == null && !showingNotif
+
+    private val batteryReceiver = object : BroadcastReceiver() {
+        override fun onReceive(c: Context, intent: Intent) = handleBattery(intent)
+    }
+
+    private fun registerBattery() {
+        val sticky = ContextCompat.registerReceiver(
+            this, batteryReceiver,
+            IntentFilter(Intent.ACTION_BATTERY_CHANGED),
+            ContextCompat.RECEIVER_EXPORTED
+        )
+        sticky?.let { handleBattery(it) }
+    }
+
+    private fun handleBattery(i: Intent) {
+        val level = i.getIntExtra(BatteryManager.EXTRA_LEVEL, -1)
+        val scale = i.getIntExtra(BatteryManager.EXTRA_SCALE, 100).coerceAtLeast(1)
+        val status = i.getIntExtra(BatteryManager.EXTRA_STATUS, -1)
+        val plugged = i.getIntExtra(BatteryManager.EXTRA_PLUGGED, 0)
+        val voltageMv = i.getIntExtra(BatteryManager.EXTRA_VOLTAGE, 0)
+        val tempC = i.getIntExtra(BatteryManager.EXTRA_TEMPERATURE, 0) / 10.0
+
+        charging = plugged != 0 &&
+            (status == BatteryManager.BATTERY_STATUS_CHARGING || status == BatteryManager.BATTERY_STATUS_FULL)
+        chargePct = level * 100 / scale
+
+        val source = when (plugged) {
+            BatteryManager.BATTERY_PLUGGED_USB -> "USB"
+            BatteryManager.BATTERY_PLUGGED_AC -> "Charger"
+            BatteryManager.BATTERY_PLUGGED_WIRELESS -> "Wireless"
+            else -> "Charging"
+        }
+
+        // Some phones don't report current; Integer.MIN_VALUE means "not supported"
+        val bm = getSystemService(BatteryManager::class.java)
+        val currentUa = bm.getIntProperty(BatteryManager.BATTERY_PROPERTY_CURRENT_NOW)
+        val currentText = if (currentUa == Int.MIN_VALUE) "n/a" else {
+            val mA = Math.abs(currentUa) / 1000
+            val watts = Math.abs(voltageMv.toDouble() * currentUa.toDouble()) / 1e9
+            "$mA mA \u00B7 %.1f W".format(watts)
+        }
+        chargeDetail = "$source \u00B7 $currentText \u00B7 %.2f V \u00B7 %.1f\u00B0C"
+            .format(voltageMv / 1000.0, tempC)
+
+        refreshMedia()
+    }
 
     // ---------- notifications ----------
     override fun onNotificationPosted(sbn: StatusBarNotification) {
