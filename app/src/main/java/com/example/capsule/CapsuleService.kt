@@ -50,7 +50,7 @@ class CapsuleService : NotificationListenerService() {
     private lateinit var uiCtx: Context
     private lateinit var wm: WindowManager
     private lateinit var lp: WindowManager.LayoutParams
-    private var root: LinearLayout? = null
+    private var root: View? = null
 
     private lateinit var icon: ImageView
     private lateinit var textCol: LinearLayout
