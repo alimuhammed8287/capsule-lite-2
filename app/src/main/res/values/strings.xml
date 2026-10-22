@@ -1,0 +1,4 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="capsule_keepalive_desc">Keeps Capsule Lite running in the background. It does not read your screen or your input.</string>
+</resources>
