@@ -99,7 +99,8 @@ class CapsuleService : NotificationListenerService() {
 
     private val prefs by lazy { getSharedPreferences("capsule", MODE_PRIVATE) }
 
-    private val prefListener = SharedPreferences.OnSharedPreferenceChangeListener { _, _ ->
+    private val prefListener = SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
+        if (key == "diag") return@OnSharedPreferenceChangeListener
         handler.post {
             if (root == null) return@post
             root?.let { v -> runCatching { wm.removeView(v) } }
@@ -179,12 +180,31 @@ class CapsuleService : NotificationListenerService() {
         }
     })
 
+    // ---------- diagnostics (shown in the app's settings screen) ----------
+
+    private fun diag(msg: String) {
+        val time = java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.US).format(java.util.Date())
+        val old = prefs.getString("diag", "") ?: ""
+        val lines = (old.split("\n").filter { it.isNotBlank() } + "$time $msg").takeLast(10)
+        prefs.edit().putString("diag", lines.joinToString("\n")).apply()
+    }
+
     // ---------- lifecycle ----------
 
     override fun onListenerConnected() {
+        diag("listener connected")
         if (root != null) return
-        if (!Settings.canDrawOverlays(this)) return
-        buildOverlay()
+        if (!Settings.canDrawOverlays(this)) {
+            diag("overlay permission missing, not started")
+            return
+        }
+        try {
+            buildOverlay()
+        } catch (e: Exception) {
+            diag("overlay FAILED: ${e.javaClass.simpleName}: ${e.message}")
+            return
+        }
+        diag("overlay added: ${lp.width}x${lp.height} at y=${lp.y}")
         registerBattery()
         prefs.registerOnSharedPreferenceChangeListener(prefListener)
         val m = getSystemService(MediaSessionManager::class.java)
@@ -195,8 +215,8 @@ class CapsuleService : NotificationListenerService() {
     }
 
     override fun onListenerDisconnected() {
+        diag("listener disconnected")
         teardown()
-        // Ask Android to bring the listener back, so the pill doesn't stay gone
         NotificationListenerService.requestRebind(ComponentName(this, CapsuleService::class.java))
     }
 
@@ -264,6 +284,509 @@ class CapsuleService : NotificationListenerService() {
 
         miniText = TextView(uiCtx).apply {
             setTextColor(Color.WHITE)
+            textSize = 13f
+            isSingleLine = true
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply { marginStart = dp(12) }
+        }
+        icon = ImageView(uiCtx).apply {
+            layoutParams = LinearLayout.LayoutParams(dp(40), dp(40)).apply { marginStart = dp(12) }
+            scaleType = ImageView.ScaleType.CENTER_CROP
+        }
+        title = TextView(uiCtx).apply {
+            setTextColor(Color.WHITE)
+            textSize = 14f
+            isSingleLine = true
+            ellipsize = TextUtils.TruncateAt.END
+        }
+        subtitle = TextView(uiCtx).apply {
+            setTextColor(Color.LTGRAY)
+            textSize = 12f
+            isSingleLine = true
+            ellipsize = TextUtils.TruncateAt.END
+        }
+        textCol = LinearLayout(uiCtx).apply {
+            orientation = LinearLayout.VERTICAL
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+                .apply { marginStart = dp(10); marginEnd = dp(6) }
+            addView(title)
+            addView(subtitle)
+        }
+
+        btnPrev = control(android.R.drawable.ic_media_previous, accent) {
+            controller?.transportControls?.skipToPrevious()
+        }
+        btnPlay = control(android.R.drawable.ic_media_play, accent) { togglePlay() }
+        btnNext = control(android.R.drawable.ic_media_next, accent) {
+            controller?.transportControls?.skipToNext()
+        }
+        btnAnswer = control(android.R.drawable.ic_menu_call, Color.parseColor("#34C759")) {
+            runCatching { callAnswer?.actionIntent?.send() }
+        }
+        btnDecline = control(android.R.drawable.ic_menu_close_clear_cancel, Color.parseColor("#FF3B30")) {
+            runCatching { callHangup?.actionIntent?.send() }
+        }
+
+        // Quick reply chips for message notifications that accept a reply
+        chips = listOf("Yes", "Later", "Busy").map { text ->
+            TextView(uiCtx).apply {
+                this.text = text
+                setTextColor(Color.WHITE)
+                textSize = 13f
+                isSingleLine = true
+                setPadding(dp(8), dp(4), dp(8), dp(4))
+                background = GradientDrawable().apply {
+                    setColor(0xFF333333.toInt())
+                    cornerRadius = dp(14).toFloat()
+                }
+                layoutParams = LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.WRAP_CONTENT,
+                    LinearLayout.LayoutParams.WRAP_CONTENT
+                ).apply { marginStart = dp(6) }
+                setOnClickListener { sendReply(text) }
+            }
+        }
+
+        row.addView(miniText)
+        row.addView(icon)
+        row.addView(textCol)
+        row.addView(btnPrev)
+        row.addView(btnPlay)
+        row.addView(btnNext)
+        chips.forEach { row.addView(it) }
+        row.addView(btnDecline)
+        row.addView(btnAnswer)
+
+        val wrap = FrameLayout(uiCtx).apply {
+            setOnTouchListener { _, e -> onPillTouch(e) }
+            addView(
+                row,
+                FrameLayout.LayoutParams(
+                    FrameLayout.LayoutParams.MATCH_PARENT,
+                    FrameLayout.LayoutParams.MATCH_PARENT
+                ).apply { setMargins(pad, pad, pad, pad) }
+            )
+        }
+
+        lp = WindowManager.LayoutParams(
+            miniW + 2 * pad, miniH + 2 * pad,
+            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS or
+                WindowManager.LayoutParams.FLAG_WATCH_OUTSIDE_TOUCH,
+            PixelFormat.TRANSLUCENT
+        ).apply {
+            gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL
+            x = offX
+            y = (topY - pad).coerceAtLeast(0)
+            layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS
+        }
+        if (expanded) {
+            lp.width = expW + 2 * pad
+            lp.height = expH + 2 * pad
+        }
+
+        pill = row
+        root = wrap
+        applyVisibility()
+        wm.addView(wrap, lp)
+    }
+
+    private fun control(res: Int, tint: Int, onClick: () -> Unit) = ImageButton(uiCtx).apply {
+        setImageResource(res)
+        setColorFilter(tint)
+        background = null
+        layoutParams = LinearLayout.LayoutParams(dp(40), dp(40))
+        setOnClickListener {
+            onClick()
+            peek(4000)
+        }
+    }
+
+    // ---------- touch and gestures ----------
+
+    private fun onPillTouch(e: MotionEvent): Boolean {
+        if (e.action == MotionEvent.ACTION_OUTSIDE) {
+            // Tap anywhere outside the window while expanded: collapse
+            if (expanded && !callActive) {
+                handler.removeCallbacks(collapse)
+                collapse.run()
+            }
+            return false
+        }
+        return gestures.onTouchEvent(e)
+    }
+
+    private fun dispatchGesture(key: String) {
+        val action = prefs.getString(key, CapsulePrefs.defaultFor(key)) ?: "none"
+        runAction(action)
+    }
+
+    private fun runAction(action: String) {
+        when (action) {
+            "expand" -> if (expanded) {
+                handler.removeCallbacks(collapse)
+                collapse.run()
+            } else {
+                peek(6000)
+            }
+            "play_pause" -> togglePlay()
+            "next" -> controller?.transportControls?.skipToNext()
+            "previous" -> controller?.transportControls?.skipToPrevious()
+            "flashlight" -> toggleTorch()
+            "volume_up" -> audio().adjustStreamVolume(AudioManager.STREAM_MUSIC, AudioManager.ADJUST_RAISE, AudioManager.FLAG_SHOW_UI)
+            "volume_down" -> audio().adjustStreamVolume(AudioManager.STREAM_MUSIC, AudioManager.ADJUST_LOWER, AudioManager.FLAG_SHOW_UI)
+            "brightness_up" -> adjustBrightness(25)
+            "brightness_down" -> adjustBrightness(-25)
+            "open_maps" -> launch(packageManager.getLaunchIntentForPackage(CapsulePrefs.MAPS_PKG))
+            "open_camera" -> launch(Intent(MediaStore.INTENT_ACTION_STILL_IMAGE_CAMERA))
+            "open_dialer" -> launch(Intent(Intent.ACTION_DIAL))
+        }
+    }
+
+    private fun audio() = getSystemService(AudioManager::class.java)
+
+    private fun launch(i: Intent?) {
+        if (i == null) return
+        i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        runCatching { startActivity(i) }
+    }
+
+    private fun togglePlay() {
+        val c = controller ?: return
+        if (c.playbackState?.state == PlaybackState.STATE_PLAYING) {
+            c.transportControls.pause()
+        } else {
+            c.transportControls.play()
+        }
+    }
+
+    private fun toggleTorch() {
+        val cam = getSystemService(CameraManager::class.java)
+        runCatching {
+            val id = cam.cameraIdList.firstOrNull {
+                cam.getCameraCharacteristics(it).get(CameraCharacteristics.FLASH_INFO_AVAILABLE) == true
+            } ?: return
+            torchOn = !torchOn
+            cam.setTorchMode(id, torchOn)
+        }
+    }
+
+    private fun adjustBrightness(delta: Int) {
+        if (!Settings.System.canWrite(this)) return   // needs the brightness permission in settings
+        runCatching {
+            val cur = Settings.System.getInt(contentResolver, Settings.System.SCREEN_BRIGHTNESS, 128)
+            Settings.System.putInt(
+                contentResolver,
+                Settings.System.SCREEN_BRIGHTNESS_MODE,
+                Settings.System.SCREEN_BRIGHTNESS_MODE_MANUAL
+            )
+            Settings.System.putInt(contentResolver, Settings.System.SCREEN_BRIGHTNESS, (cur + delta).coerceIn(0, 255))
+        }
+    }
+
+    // ---------- expand / collapse ----------
+
+    private fun peek(ms: Long) {
+        setExpanded(true)
+        handler.removeCallbacks(collapse)
+        if (!callActive) handler.postDelayed(collapse, ms)
+    }
+
+    private fun setExpanded(e: Boolean) {
+        val r = root ?: return
+        if (e == expanded) {
+            applyVisibility()
+            return
+        }
+        expanded = e
+        if (e) {
+            icon.alpha = 0f
+            textCol.alpha = 0f
+        }
+        applyVisibility()
+        if (e) {
+            icon.animate().alpha(1f).setStartDelay(120).setDuration(180).start()
+            textCol.animate().alpha(1f).setStartDelay(120).setDuration(180).start()
+        }
+
+        val pad = touchPad()
+        val fromW = lp.width
+        val fromH = lp.height
+        val toW = (if (e) expW else miniW) + 2 * pad
+        val toH = (if (e) expH else miniH) + 2 * pad
+        ValueAnimator.ofFloat(0f, 1f).apply {
+            duration = 260
+            interpolator = OvershootInterpolator(0.6f)
+            addUpdateListener {
+                val f = it.animatedFraction
+                lp.width = (fromW + (toW - fromW) * f).toInt()
+                lp.height = (fromH + (toH - fromH) * f).toInt()
+                if (r.isAefs.getInt("miniW", 100))
+        if (prefs.contains("miniH")) miniH = dp(prefs.getInt("miniH", 40))
+        if (prefs.contains("expW")) expW = minOf(screenW - dp(24), dp(prefs.getInt("expW", 340)))
+        if (prefs.contains("topY")) topY = dp(prefs.getInt("topY", 6))
+        val offX = dp(prefs.getInt("offX", 0))
+
+        val accent = uiCtx.getColor(android.R.color.system_accent1_200)
+
+        val row = LinearLayout(uiCtx).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            background = GradientDrawable().apply {
+                setColor(Color.BLACK)
+                cornerRadius = dp(40).toFloat()
+            }
+            setOnTouchListener { _, e -> onPillTouch(e) }
+        }
+
+        miniText = TextView(uiCtx).apply {
+            setTextColor(Color.WHITE)
+            textSize = 13f
+            isSingleLine = true
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+            ).apply { marginStart = dp(12) }
+        }
+        icon = ImageView(uiCtx).apply {
+            layoutParams = LinearLayout.LayoutParams(dp(40), dp(40)).apply { marginStart = dp(12) }
+            scaleType = ImageView.ScaleType.CENTER_CROP
+        }
+        title = TextView(uiCtx).apply {
+            setTextColor(Color.WHITE)
+            textSize = 14f
+            isSingleLine = true
+            ellipsize = TextUtils.TruncateAt.END
+        }
+        subtitle = TextView(uiCtx).apply {
+            setTextColor(Color.LTGRAY)
+            textSize = 12f
+            isSingleLine = true
+            ellipsize = TextUtils.TruncateAt.END
+        }
+        textCol = LinearLayout(uiCtx).apply {
+            orientation = LinearLayout.VERTICAL
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+                .apply { marginStart = dp(10); marginEnd = dp(6) }
+            addView(title)
+            addView(subtitle)
+        }
+
+        btnPrev = control(android.R.drawable.ic_media_previous, accent) {
+            controller?.transportControls?.skipToPrevious()
+        }
+        btnPlay = control(android.R.drawable.ic_media_play, accent) { togglePlay() }
+        btnNext = control(android.R.drawable.ic_media_next, accent) {
+            controller?.transportControls?.skipToNext()
+        }
+        btnAnswer = control(android.R.drawable.ic_menu_call, Color.parseColor("#34C759")) {
+            runCatching { callAnswer?.actionIntent?.send() }
+        }
+        btnDecline = control(android.R.drawable.ic_menu_close_clear_cancel, Color.parseColor("#FF3B30")) {
+            runCatching { callHangup?.actionIntent?.send() }
+        }
+
+        // Quick reply chips for message notifications that accept a reply
+        chips = listOf("Yes", "Later", "Busy").map { text ->
+            TextView(uiCtx).apply {
+                this.text = text
+                setTextColor(Color.WHITE)
+                textSize = 13f
+                isSingleLine = true
+                setPadding(dp(8), dp(4), dp(8), dp(4))
+                background = GradientDrawable().apply {
+                    setColor(0xFF333333.toInt())
+                    cornerRadius = dp(14).toFloat()
+                }
+                layoutParams = LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.WRAP_CONTENT,
+                    LinearLayout.LayoutParams.WRAP_CONTENT
+                ).apply { marginStart = dp(6) }
+                setOnClickListener { sendReply(text) }
+            }
+        }
+
+        row.addView(miniText)
+        row.addView(icon)
+        row.addView(textCol)
+        row.addView(btnPrev)
+        row.addView(btnPlay)
+        row.addView(btnNext)
+        chips.forEach { row.addView(it) }
+        row.addView(btnDecline)
+        row.addView(btnAnswer)
+
+        val wrap = FrameLayout(uiCtx).apply {
+            setOnTouchListener { _, e -> onPillTouch(e) }
+            addView(
+                row,
+                FrameLayout.LayoutParams(
+                    FrameLayout.LayoutParams.MATCH_PARENT,
+                    FrameLayout.LayoutParams.MATCH_PARENT
+                ).apply { setMargins(pad, pad, pad, pad) }
+            )
+        }
+
+        lp = WindowManager.LayoutParams(
+            miniW + 2 * pad, miniH + 2 * pad,
+            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS or
+                WindowManager.LayoutParams.FLAG_WATCH_OUTSIDE_TOUCH,
+            PixelFormat.TRANSLUCENT
+        ).apply {
+            gravity = Gravity.TOP or Gravity.CENTER_HORIZONTAL
+            x = offX
+            y = (topY - pad).coerceAtLeast(0)
+            layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS
+        }
+        if (expanded) {
+            lp.width = expW + 2 * pad
+            lp.height = expH + 2 * pad
+        }
+
+        pill = row
+        root = wrap
+        applyVisibility()
+        wm.addView(wrap, lp)
+    }
+
+    private fun control(res: Int, tint: Int, onClick: () -> Unit) = ImageButton(uiCtx).apply {
+        setImageResource(res)
+        setColorFilter(tint)
+        background = null
+        layoutParams = LinearLayout.LayoutParams(dp(40), dp(40))
+        setOnClickListener {
+            onClick()
+            peek(4000)
+        }
+    }
+
+    // ---------- touch and gestures ----------
+
+    private fun onPillTouch(e: MotionEvent): Boolean {
+        if (e.action == MotionEvent.ACTION_OUTSIDE) {
+            // Tap anywhere outside the window while expanded: collapse
+            if (expanded && !callActive) {
+                handler.removeCallbacks(collapse)
+                collapse.run()
+            }
+            return false
+        }
+        return gestures.onTouchEvent(e)
+    }
+
+    private fun dispatchGesture(key: String) {
+        val action = prefs.getString(key, CapsulePrefs.defaultFor(key)) ?: "none"
+        runAction(action)
+    }
+
+    private fun runAction(action: String) {
+        when (action) {
+            "expand" -> if (expanded) {
+                handler.removeCallbacks(collapse)
+                collapse.run()
+            } else {
+                peek(6000)
+            }
+            "play_pause" -> togglePlay()
+            "next" -> controller?.transportControls?.skipToNext()
+            "previous" -> controller?.transportControls?.skipToPrevious()
+            "flashlight" -> toggleTorch()
+            "volume_up" -> audio().adjustStreamVolume(AudioManager.STREAM_MUSIC, AudioManager.ADJUST_RAISE, AudioManager.FLAG_SHOW_UI)
+            "volume_down" -> audio().adjustStreamVolume(AudioManager.STREAM_MUSIC, AudioManager.ADJUST_LOWER, AudioManager.FLAG_SHOW_UI)
+            "brightness_up" -> adjustBrightness(25)
+            "brightness_down" -> adjustBrightness(-25)
+            "open_maps" -> launch(packageManager.getLaunchIntentForPackage(CapsulePrefs.MAPS_PKG))
+            "open_camera" -> launch(Intent(MediaStore.INTENT_ACTION_STILL_IMAGE_CAMERA))
+            "open_dialer" -> launch(Intent(Intent.ACTION_DIAL))
+        }
+    }
+
+    private fun audio() = getSystemService(AudioManager::class.java)
+
+    private fun launch(i: Intent?) {
+        if (i == null) return
+        i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        runCatching { startActivity(i) }
+    }
+
+    private fun togglePlay() {
+        val c = controller ?: return
+        if (c.playbackState?.state == PlaybackState.STATE_PLAYING) {
+            c.transportControls.pause()
+        } else {
+            c.transportControls.play()
+        }
+    }
+
+    private fun toggleTorch() {
+        val cam = getSystemService(CameraManager::class.java)
+        runCatching {
+            val id = cam.cameraIdList.firstOrNull {
+                cam.getCameraCharacteristics(it).get(CameraCharacteristics.FLASH_INFO_AVAILABLE) == true
+            } ?: return
+            torchOn = !torchOn
+            cam.setTorchMode(id, torchOn)
+        }
+    }
+
+    private fun adjustBrightness(delta: Int) {
+        if (!Settings.System.canWrite(this)) return   // needs the brightness permission in settings
+        runCatching {
+            val cur = Settings.System.getInt(contentResolver, Settings.System.SCREEN_BRIGHTNESS, 128)
+            Settings.System.putInt(
+                contentResolver,
+                Settings.System.SCREEN_BRIGHTNESS_MODE,
+                Settings.System.SCREEN_BRIGHTNESS_MODE_MANUAL
+            )
+            Settings.System.putInt(contentResolver, Settings.System.SCREEN_BRIGHTNESS, (cur + delta).coerceIn(0, 255))
+        }
+    }
+
+    // ---------- expand / collapse ----------
+
+    private fun peek(ms: Long) {
+        setExpanded(true)
+        handler.removeCallbacks(collapse)
+        if (!callActive) handler.postDelayed(collapse, ms)
+    }
+
+    private fun setExpanded(e: Boolean) {
+        val r = root ?: return
+        if (e == expanded) {
+            applyVisibility()
+            return
+        }
+        expanded = e
+        if (e) {
+            icon.alpha = 0f
+            textCol.alpha = 0f
+        }
+        applyVisibility()
+        if (e) {
+            icon.animate().alpha(1f).setStartDelay(120).setDuration(180).start()
+            textCol.animate().alpha(1f).setStartDelay(120).setDuration(180).start()
+        }
+
+        val pad = touchPad()
+        val fromW = lp.width
+        val fromH = lp.height
+        val toW = (if (e) expW else miniW) + 2 * pad
+        val toH = (if (e) expH else miniH) + 2 * pad
+        ValueAnimator.ofFloat(0f, 1f).apply {
+            duration = 260
+            interpolator = OvershootInterpolator(0.6f)
+            addUpdateListener {
+                val f = it.animatedFraction
+                lp.width = (fromW + (toW - fromW) * f).toInt()
+                lp.height = (fromH + (toH - fromH) * f).toInt()
+                if (r.isAxtColor(Color.WHITE)
             textSize = 13f
             isSingleLine = true
             layoutParams = LinearLayout.LayoutParams(
