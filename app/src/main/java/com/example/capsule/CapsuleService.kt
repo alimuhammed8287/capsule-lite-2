@@ -141,7 +141,7 @@ class CapsuleService : NotificationListenerService() {
         MediaSessionManager.OnActiveSessionsChangedListener { list -> pickController(list) }
 
     // Gestures: tap, double tap, long press, and swipes. Each one runs the action chosen in settings.
-    private val gestures = GestureDetector(this, object : GestureDetector.SimpleOnGestureListener() {
+    private val gestures by lazy { GestureDetector(this, object : GestureDetector.SimpleOnGestureListener() {
         override fun onDown(e: MotionEvent): Boolean = true
 
         override fun onSingleTapConfirmed(e: MotionEvent): Boolean {
@@ -178,7 +178,7 @@ class CapsuleService : NotificationListenerService() {
             dispatchGesture(key)
             return true
         }
-    })
+    }) }
 
     // ---------- diagnostics (shown in the app's settings screen) ----------
 
