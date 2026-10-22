@@ -48,6 +48,7 @@ class MainActivity : Activity() {
         toggle(col, "Google Maps navigation", "showMaps", true)
         toggle(col, "Other notifications", "showNotifs", true)
         toggle(col, "Debug: show raw Maps text", "debugMaps", false)
+        toggle(col, "Show charging status", "showCharging", true)
 
         header(col, "Size and position")
         slider(col, "Collapsed width", "miniW", 40, 200, 100)
