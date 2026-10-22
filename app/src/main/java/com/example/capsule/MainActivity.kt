@@ -17,6 +17,7 @@ import android.widget.TextView
 class MainActivity : Activity() {
 
     private lateinit var status: TextView
+    private lateinit var diagText: TextView
     private val prefs by lazy { getSharedPreferences("capsule", MODE_PRIVATE) }
 
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
@@ -31,6 +32,17 @@ class MainActivity : Activity() {
 
         status = TextView(this).apply { textSize = 16f }
         col.addView(status)
+
+        header(col, "Diagnostics (latest service events)")
+        diagText = TextView(this).apply {
+            textSize = 13f
+            typeface = android.graphics.Typeface.MONOSPACE
+        }
+        col.addView(diagText)
+        button(col, "Clear diagnostics") {
+            prefs.edit().remove("diag").apply()
+            diagText.text = ""
+        }
 
         header(col, "Permissions")
         button(col, "1. Allow display over other apps") {
@@ -149,6 +161,8 @@ class MainActivity : Activity() {
             "Notification access: ${if (listener) "OK" else "missing"}\n" +
             "Keep-alive (Accessibility): ${if (keepAlive) "OK" else "off"}\n" +
             "Brightness control: ${if (brightness) "OK" else "off"}"
+
+        diagText.text = prefs.getString("diag", null) ?: "no service events yet"
 
         if (overlay && listener) {
             NotificationListenerService.requestRebind(
